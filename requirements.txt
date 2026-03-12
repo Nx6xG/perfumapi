@@ -1,8 +1,8 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-requests==2.31.0
-beautifulsoup4==4.12.2
-supabase==2.3.0
-python-dotenv==1.0.0
-pydantic==2.5.2
-httpx==0.25.2
+fastapi>=0.115.0
+uvicorn>=0.32.0
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+supabase>=2.10.0
+python-dotenv>=1.0.0
+pydantic>=2.10.0
+httpx>=0.27.0
