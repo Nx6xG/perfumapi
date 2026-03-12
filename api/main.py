@@ -21,9 +21,9 @@ from utils.db import (
     get_perfumes_without_images,
     find_perfume_by_name_brand,
 )
-from scraper.wikiparfum import fetch_wikiparfum_image, fetch_images_batch
+from scraper.wikiparfum import fetch_wikiparfum_image, fetch_images_batch, search_wikiparfum
 
-app = FastAPI(title="PerfumAPI", version="3.2.0")
+app = FastAPI(title="PerfumAPI", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -247,7 +247,7 @@ async def scrape_parfumo(query: str, limit: int = 10) -> list[dict]:
 
 @app.get("/")
 def root():
-    return {"message": "PerfumAPI v3.2 — Parfumo Scraper + Wikiparfum Images", "docs": "/docs"}
+    return {"message": "PerfumAPI v4.0 — Wikiparfum Scraper", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -286,22 +286,22 @@ async def smart_search(
     limit: int = Query(10, ge=1, le=20),
 ):
     """
-    SMART SEARCH — main endpoint for FLACON.
-    1. Search local DB
-    2. If <3 results → scrape Parfumo (parallel)
-    3. Cache in DB for next time
+    SMART SEARCH v4 — main endpoint for FLACON.
+    1. Search local DB cache
+    2. If <3 results → scrape Wikiparfum (parallel)
+    3. Cache scraped data in DB for next time
     """
     local_results = search_perfumes(q, limit=limit)
 
     if len(local_results) >= 3:
         return {"perfumes": local_results, "count": len(local_results), "source": "local"}
 
-    # Scrape Parfumo
+    # Scrape Wikiparfum
     scraped = []
     try:
-        scraped = await scrape_parfumo(q, limit=limit)
+        scraped = await search_wikiparfum(q, limit=limit)
     except Exception as e:
-        print(f"Scrape failed: {e}")
+        print(f"Wikiparfum scrape failed: {e}")
 
     # Cache in DB
     if scraped:
@@ -322,7 +322,7 @@ async def smart_search(
     return {
         "perfumes": combined[:limit],
         "count": len(combined[:limit]),
-        "source": "local+parfumo" if scraped else "local",
+        "source": "local+wikiparfum" if scraped else "local",
         "scraped_count": len(scraped),
     }
 
