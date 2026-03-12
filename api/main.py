@@ -100,32 +100,36 @@ async def parfumo_detail(url: str) -> dict | None:
             year = None
 
             if h1:
-                # Name is the text content of h1 (excluding nested links)
-                name_parts = []
-                for child in h1.children:
-                    if hasattr(child, 'name') and child.name == 'a':
-                        # Links in h1 are brand or year
-                        href = child.get("href", "")
-                        t = child.get_text(strip=True)
-                        if "/Perfumes/" in href and "/Release_Years/" not in href:
-                            brand = t
-                        elif "/Release_Years/" in href:
-                            try:
-                                year = int(t)
-                            except ValueError:
-                                pass
-                    else:
-                        name_parts.append(str(child).strip())
-                name = " ".join(name_parts).strip()
+                # Brand is in a link inside h1
+                brand_link = h1.select_one("a[href*='/Perfumes/']")
+                if brand_link:
+                    brand = brand_link.get_text(strip=True)
+
+                # Year is in a link to /Release_Years/
+                year_link = h1.select_one("a[href*='/Release_Years/']")
+                if year_link:
+                    try:
+                        year = int(year_link.get_text(strip=True))
+                    except ValueError:
+                        pass
+
+                # Name: remove all nested tags, take only direct text nodes
+                # Clone h1, remove all child tags, get remaining text
+                for tag in h1.find_all(True):
+                    tag.decompose()
+                name = h1.get_text(strip=True)
 
             # Fallback: extract from title tag
             if not name:
                 title = soup.select_one("title")
                 if title:
-                    name = title.get_text(strip=True).split(" by ")[0].split(" » ")[0].strip()
+                    t = title.get_text(strip=True)
+                    name = t.split(" by ")[0].split(" » ")[0].strip()
 
             if not brand:
-                brand_link = soup.select_one("h1 a[href*='/Perfumes/']")
+                # Re-parse since we decomposed h1
+                soup2 = BeautifulSoup(resp.text, "html.parser")
+                brand_link = soup2.select_one("h1 a[href*='/Perfumes/']")
                 if brand_link:
                     brand = brand_link.get_text(strip=True)
 
@@ -238,19 +242,254 @@ async def parfumo_detail(url: str) -> dict | None:
 
 
 async def scrape_parfumo(query: str, limit: int = 10) -> list[dict]:
-    """Full pipeline: search Parfumo → scrape details → return list."""
-    urls = await parfumo_search(query, limit=limit)
-    results = []
+    """
+    Fast scrape: extract all data directly from the Parfumo search results page.
+    Single HTTP request — no detail page visits needed.
+    """
+    url = f"{BASE}/s_perfumes.php?search={quote_plus(query)}"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code != 200:
+                return []
 
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        for url in urls:
-            detail = await parfumo_detail(url)
-            if detail and detail.get("name"):
-                results.append(detail)
-            if len(results) >= limit:
-                break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            seen = set()
 
-    return results
+            # Each perfume result on Parfumo is wrapped in an element with itemprop="itemListElement"
+            # or we can find them by looking for perfume image + info blocks
+            # The search page contains structured data with schema.org markup
+
+            # Strategy: find all perfume links that point to detail pages
+            # and extract surrounding context (image, brand, notes)
+            for item in soup.select("[itemtype='https://schema.org/Product'], [itemtype='http://schema.org/Product']"):
+                try:
+                    perfume = parse_search_item(item)
+                    if perfume and perfume["perfume_url"] not in seen:
+                        seen.add(perfume["perfume_url"])
+                        results.append(perfume)
+                        if len(results) >= limit:
+                            break
+                except Exception as e:
+                    print(f"Parse error: {e}")
+                    continue
+
+            # Fallback: if schema.org parsing didn't work, try generic approach
+            if not results:
+                # Find all perfume detail links
+                for link in soup.select("a[href*='/Perfumes/']"):
+                    href = link.get("href", "")
+                    full = href if href.startswith("http") else f"{BASE}{href}"
+                    path_parts = full.replace(BASE, "").strip("/").split("/")
+
+                    if len(path_parts) < 3 or path_parts[0] != "Perfumes":
+                        continue
+                    if "/prices" in full or "/reviews" in full or full in seen:
+                        continue
+                    if len(path_parts) == 2:
+                        continue
+
+                    seen.add(full)
+
+                    # Get the parent container for context
+                    parent = link
+                    for _ in range(5):
+                        if parent.parent:
+                            parent = parent.parent
+                        else:
+                            break
+
+                    # Extract name (clean text only)
+                    raw_name = link.get_text(strip=True)
+                    # Clean HTML entities from name
+                    name = BeautifulSoup(raw_name, "html.parser").get_text(strip=True)
+
+                    # Brand
+                    brand = ""
+                    brand_el = parent.select_one("a[href*='/Perfumes/'] span[itemprop='name']")
+                    if brand_el:
+                        brand = brand_el.get_text(strip=True)
+                    if not brand:
+                        brand_el = parent.select_one(".p_brand_name a span")
+                        if brand_el:
+                            brand = brand_el.get_text(strip=True)
+
+                    # Image
+                    image_url = ""
+                    img = parent.select_one("img[src*='media.parfumo.com/perfumes']")
+                    if img:
+                        image_url = img.get("src", "") or img.get("data-src", "")
+
+                    # Notes from the search page
+                    notes_top = []
+                    notes_mid = []
+                    notes_base = []
+                    note_imgs = parent.select("img[alt][src*='media.parfumo.com/notes']")
+                    all_notes = [ni.get("alt", "").strip() for ni in note_imgs if ni.get("alt", "").strip()]
+                    if all_notes:
+                        third = max(len(all_notes) // 3, 1)
+                        notes_top = all_notes[:third]
+                        notes_mid = all_notes[third:third*2]
+                        notes_base = all_notes[third*2:]
+
+                    # Year
+                    year = None
+                    year_el = parent.select_one("a[href*='/Release_Years/']")
+                    if year_el:
+                        try:
+                            year = int(year_el.get_text(strip=True))
+                        except ValueError:
+                            pass
+
+                    # Gender
+                    gender = "Unisex"
+                    text_content = parent.get_text(strip=True).lower()
+                    if "for men" in text_content and "for women" not in text_content:
+                        gender = "Men"
+                    elif "for women" in text_content and "for men" not in text_content:
+                        gender = "Women"
+
+                    # Description
+                    description = ""
+                    desc_match = re.search(r'(A (?:popular )?perfume by .+?(?:released in \d{4}\.?|\.))', parent.get_text())
+                    if desc_match:
+                        description = desc_match.group(1)[:300]
+
+                    # Votes/Ratings
+                    votes = None
+                    rating_el = parent.select_one("[itemprop='ratingCount']")
+                    if rating_el:
+                        try:
+                            votes = int(rating_el.get_text(strip=True).replace(",", ""))
+                        except ValueError:
+                            pass
+
+                    if name and len(name) > 1:
+                        results.append({
+                            "name": name,
+                            "brand": brand,
+                            "release_year": year,
+                            "gender": gender,
+                            "notes_top": notes_top,
+                            "notes_middle": notes_mid,
+                            "notes_base": notes_base,
+                            "rating": None,
+                            "votes": votes,
+                            "description": description,
+                            "longevity": "",
+                            "sillage": "",
+                            "image_url": image_url,
+                            "perfume_url": full,
+                        })
+
+                    if len(results) >= limit:
+                        break
+
+            return results
+
+    except Exception as e:
+        print(f"Parfumo scrape error: {e}")
+        return []
+
+
+def parse_search_item(item) -> dict | None:
+    """Parse a single schema.org Product item from search results."""
+    name = ""
+    brand = ""
+    year = None
+    image_url = ""
+    perfume_url = ""
+
+    # Name
+    name_el = item.select_one("[itemprop='name']")
+    if name_el:
+        name = name_el.get_text(strip=True)
+
+    # Brand
+    brand_scope = item.select_one("[itemprop='brand'] [itemprop='name']")
+    if brand_scope:
+        brand = brand_scope.get_text(strip=True)
+    # Remove brand from name if it's the same
+    if brand and name == brand:
+        name_el2 = item.select_one("h2, h3, .perfume_name")
+        if name_el2:
+            name = name_el2.get_text(strip=True)
+
+    # URL
+    url_el = item.select_one("[itemprop='url']")
+    if url_el:
+        perfume_url = url_el.get("href", "")
+    if not perfume_url:
+        link = item.select_one("a[href*='/Perfumes/']")
+        if link:
+            perfume_url = link.get("href", "")
+    if perfume_url and not perfume_url.startswith("http"):
+        perfume_url = f"{BASE}{perfume_url}"
+
+    # Image
+    img = item.select_one("img[src*='media.parfumo.com/perfumes']")
+    if img:
+        image_url = img.get("src", "")
+
+    # Year
+    year_el = item.select_one("a[href*='/Release_Years/']")
+    if year_el:
+        try:
+            year = int(year_el.get_text(strip=True))
+        except ValueError:
+            pass
+
+    # Notes
+    note_imgs = item.select("img[alt][src*='media.parfumo.com/notes']")
+    all_notes = [ni.get("alt", "").strip() for ni in note_imgs if ni.get("alt", "").strip()]
+    third = max(len(all_notes) // 3, 1) if all_notes else 0
+    notes_top = all_notes[:third] if all_notes else []
+    notes_mid = all_notes[third:third*2] if all_notes else []
+    notes_base = all_notes[third*2:] if all_notes else []
+
+    # Gender
+    gender = "Unisex"
+    text = item.get_text(strip=True).lower()
+    if "for men" in text and "for women" not in text:
+        gender = "Men"
+    elif "for women" in text and "for men" not in text:
+        gender = "Women"
+
+    # Description
+    description = ""
+    desc_match = re.search(r'(A (?:popular )?perfume by .+?(?:released in \d{4}\.?|\.))', item.get_text())
+    if desc_match:
+        description = desc_match.group(1)[:300]
+
+    # Votes
+    votes = None
+    rating_el = item.select_one("[itemprop='ratingCount']")
+    if rating_el:
+        try:
+            votes = int(rating_el.get_text(strip=True).replace(",", ""))
+        except ValueError:
+            pass
+
+    if not name or not perfume_url:
+        return None
+
+    return {
+        "name": name,
+        "brand": brand,
+        "release_year": year,
+        "gender": gender,
+        "notes_top": notes_top,
+        "notes_middle": notes_mid,
+        "notes_base": notes_base,
+        "rating": None,
+        "votes": votes,
+        "description": description,
+        "longevity": "",
+        "sillage": "",
+        "image_url": image_url,
+        "perfume_url": perfume_url,
+    }
 
 
 # ──────────────────────────────────────────────
