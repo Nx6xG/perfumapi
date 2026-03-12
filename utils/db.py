@@ -72,6 +72,71 @@ def upsert_many(perfumes: list[dict]):
     return result.data or []
 
 
+def update_image_url(perfume_id: str, image_url: str):
+    """Update the image_url for a single perfume by ID."""
+    result = (
+        supabase.table("perfume_catalog")
+        .update({"image_url": image_url})
+        .eq("id", perfume_id)
+        .execute()
+    )
+    return result.data
+
+
+def update_image_urls_batch(updates: dict[str, str]):
+    """Batch update image_urls. updates = {perfume_id: image_url}."""
+    results = []
+    for pid, url in updates.items():
+        try:
+            r = update_image_url(pid, url)
+            if r:
+                results.extend(r)
+        except Exception as e:
+            print(f"Failed to update image for {pid}: {e}")
+    return results
+
+
+def get_perfumes_without_images(limit: int = 50):
+    """Get perfumes that have no image_url set."""
+    result = (
+        supabase.table("perfume_catalog")
+        .select("id,name,brand")
+        .or_("image_url.is.null,image_url.eq.")
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
+def find_perfume_by_name_brand(name: str, brand: str = ""):
+    """Find a perfume by exact or close name+brand match."""
+    q_name = f"%{name}%"
+    query = supabase.table("perfume_catalog").select("*")
+    if brand:
+        q_brand = f"%{brand}%"
+        query = query.ilike("name", q_name).ilike("brand", q_brand)
+    else:
+        query = query.ilike("name", q_name)
+    result = query.limit(5).execute()
+    return result.data or []
+
+
 def get_stats():
     result = supabase.table("perfume_catalog").select("id", count="exact").execute()
-    return {"total_perfumes": result.count or 0}
+    total = result.count or 0
+
+    # Count perfumes with images
+    img_result = (
+        supabase.table("perfume_catalog")
+        .select("id", count="exact")
+        .neq("image_url", "")
+        .not_.is_("image_url", "null")
+        .execute()
+    )
+    with_images = img_result.count or 0
+
+    return {
+        "total_perfumes": total,
+        "with_images": with_images,
+        "without_images": total - with_images,
+    }
