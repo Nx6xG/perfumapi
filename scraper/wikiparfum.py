@@ -280,12 +280,11 @@ async def search_wikiparfum(
 ) -> list[dict]:
     """
     Search Wikiparfum for perfumes matching the query.
-    Returns list of full perfume data dicts.
 
     Strategy:
-    1. Build slug variations from query
-    2. Try all as direct URLs in parallel
-    3. Collect all that are valid perfume pages
+    1. Try slug variations as direct perfume URLs (parallel)
+    2. Always try query as brand name → scrape brand page
+    3. If multi-word, also try first word as brand
     """
     base_slug = _slugify(query)
     slugs = []
@@ -298,6 +297,7 @@ async def search_wikiparfum(
 
     results = []
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        # --- Step 1: Try slug variations ---
         tasks = [_try_url_full(client, url) for url in urls]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -309,17 +309,21 @@ async def search_wikiparfum(
                     seen_names.add(key)
                     results.append(resp)
 
-        # If we got results, return them
         if results:
             return results[:limit]
 
-        # --- Fallback: Try brand page if query looks like "Brand Name" ---
+        # --- Step 2: Try full query as brand ---
+        brand_results = await _search_brand_page_full(
+            client, query, query.strip(), limit
+        )
+        if brand_results:
+            return brand_results[:limit]
+
+        # --- Step 3: Multi-word → try first word as brand ---
         parts = query.strip().split()
         if len(parts) >= 2:
-            # Try treating first word as brand
-            possible_brand = parts[0]
             brand_results = await _search_brand_page_full(
-                client, query, possible_brand, limit
+                client, query, parts[0], limit
             )
             if brand_results:
                 return brand_results[:limit]
@@ -333,7 +337,11 @@ async def _search_brand_page_full(
     brand: str,
     limit: int,
 ) -> list[dict]:
-    """Search a brand page for matching perfumes, return full data."""
+    """
+    Scrape a brand page for perfumes.
+    If query == brand → return all perfumes on the page.
+    If query is more specific → filter by similarity.
+    """
     slug = _brand_slug(brand)
     brand_url = f"{BASE}/en/brands/{slug}"
 
@@ -343,30 +351,49 @@ async def _search_brand_page_full(
             return []
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        query_lower = query.lower()
+        query_lower = query.lower().strip()
+        brand_lower = brand.lower().strip()
 
-        # Collect matching links
-        matches = []
+        # Is this a pure brand search? (query is just the brand name)
+        is_brand_search = (
+            query_lower == brand_lower
+            or _similarity(query_lower, brand_lower) > 0.85
+        )
+
+        # Collect all fragrance links from the brand page
+        frag_links = []
+        seen_hrefs = set()
         for link in soup.select("a[href*='/fragrances/']"):
             href = link.get("href", "")
-            link_text = link.get_text(strip=True).lower()
+            full_url = href if href.startswith("http") else f"{BASE}{href}"
 
-            score = _similarity(query_lower, link_text)
-            partial = query_lower in link_text or link_text in query_lower
+            if full_url in seen_hrefs:
+                continue
+            seen_hrefs.add(full_url)
 
-            if score > 0.3 or partial:
-                full_url = href if href.startswith("http") else f"{BASE}{href}"
-                matches.append((full_url, score + (0.3 if partial else 0)))
+            link_text = link.get_text(strip=True)
+            if not link_text or len(link_text) < 2:
+                continue
+
+            if is_brand_search:
+                # Pure brand search → take all perfumes
+                frag_links.append((full_url, 1.0))
+            else:
+                # Specific search → rank by similarity
+                score = _similarity(query_lower, link_text.lower())
+                partial = query_lower in link_text.lower() or link_text.lower() in query_lower
+                if score > 0.25 or partial:
+                    frag_links.append((full_url, score + (0.3 if partial else 0)))
 
         # Sort by score, take top candidates
-        matches.sort(key=lambda x: x[1], reverse=True)
-        matches = matches[:limit]
+        frag_links.sort(key=lambda x: x[1], reverse=True)
+        frag_links = frag_links[:limit]
 
-        # Fetch detail pages in parallel
-        if not matches:
+        if not frag_links:
             return []
 
-        tasks = [_try_url_full(client, url) for url, _ in matches]
+        # Fetch detail pages in parallel
+        tasks = [_try_url_full(client, url) for url, _ in frag_links]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         results = []
