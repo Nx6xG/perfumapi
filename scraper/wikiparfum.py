@@ -1,21 +1,19 @@
 """
-Wikiparfum Image Scraper
-========================
-Searches wikiparfum.com for perfume bottle images.
+Wikiparfum Image Scraper v2
+============================
+Fetches perfume bottle images from wikiparfum.com.
 No Cloudflare — images served via api-assets.wikiparfum.com CDN.
 
-Strategy:
-1. Search Google for 'site:wikiparfum.com {name} {brand}'
-   (Wikiparfum has no public search API, but their HTML is SSR-friendly)
-2. Alternatively: construct slug and try direct URL
-3. Scrape the detail page for the bottle image
-4. Return the CDN image URL
+Strategy (ordered by speed):
+1. Try multiple slug variations in parallel (name, name-eau-de-toilette, etc.)
+2. Scrape the brand page on Wikiparfum and find the perfume there
+3. Return the CDN bottle image URL
 """
 
 import re
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
 from difflib import SequenceMatcher
 
 HEADERS = {
@@ -29,55 +27,89 @@ HEADERS = {
 BASE = "https://www.wikiparfum.com"
 CDN_PREFIX = "https://api-assets.wikiparfum.com/"
 
+# Common suffixes Wikiparfum appends to perfume slugs
+SLUG_SUFFIXES = [
+    "",
+    "-eau-de-parfum",
+    "-eau-de-toilette",
+    "-parfum",
+    "-eau-de-parfum-1",
+    "-eau-de-toilette-1",
+    "-parfum-1",
+    "-edp",
+    "-edt",
+    "-1",
+]
+
 
 def _slugify(text: str) -> str:
     """Convert perfume name to Wikiparfum-style slug."""
     s = text.lower().strip()
-    # Replace special chars
-    s = s.replace("'", "").replace("'", "").replace("'", "")
+    # Remove common type suffixes (we add them back systematically)
+    for suffix in [
+        " eau de parfum", " eau de toilette", " parfum",
+        " edp", " edt", " cologne",
+    ]:
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+            break
+
+    s = s.replace("'", "").replace("\u2018", "").replace("\u2019", "")
     s = s.replace("&", "and")
-    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
-    s = s.replace("à", "a").replace("â", "a").replace("ä", "a")
-    s = s.replace("ù", "u").replace("û", "u").replace("ü", "u")
-    s = s.replace("ô", "o").replace("ö", "o")
-    s = s.replace("î", "i").replace("ï", "i")
-    s = s.replace("ì", "i")
-    s = s.replace("ñ", "n")
-    s = s.replace("ç", "c")
-    # Replace non-alphanum with hyphens
-    s = re.sub(r'[^a-z0-9]+', '-', s)
-    s = s.strip('-')
-    # Collapse multiple hyphens
-    s = re.sub(r'-+', '-', s)
+    for src, dst in [
+        ("\u00e9", "e"), ("\u00e8", "e"), ("\u00ea", "e"), ("\u00eb", "e"),
+        ("\u00e0", "a"), ("\u00e2", "a"), ("\u00e4", "a"),
+        ("\u00f9", "u"), ("\u00fb", "u"), ("\u00fc", "u"),
+        ("\u00f4", "o"), ("\u00f6", "o"), ("\u00f2", "o"),
+        ("\u00ee", "i"), ("\u00ef", "i"), ("\u00ec", "i"),
+        ("\u00f1", "n"), ("\u00e7", "c"),
+    ]:
+        s = s.replace(src, dst)
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    s = re.sub(r"-+", "-", s)
+    return s
+
+
+def _brand_slug(brand: str) -> str:
+    """Convert brand name to Wikiparfum brand page slug."""
+    s = brand.lower().strip()
+    s = s.replace("&", "")
+    for src, dst in [
+        ("\u00e9", "e"), ("\u00e8", "e"), ("\u00ea", "e"), ("\u00eb", "e"),
+        ("\u00e0", "a"), ("\u00e2", "a"), ("\u00e4", "a"),
+        ("\u00f9", "u"), ("\u00fb", "u"), ("\u00fc", "u"),
+        ("\u00f4", "o"), ("\u00f6", "o"),
+        ("\u00ee", "i"), ("\u00ef", "i"),
+        ("\u00f1", "n"), ("\u00e7", "c"),
+    ]:
+        s = s.replace(src, dst)
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    s = re.sub(r"-+", "-", s)
     return s
 
 
 def _similarity(a: str, b: str) -> float:
-    """Simple string similarity ratio."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
 def _extract_bottle_image(soup: BeautifulSoup) -> str | None:
     """
-    Extract the perfume bottle image URL from a Wikiparfum detail page.
-    The bottle image is the one with the CDN prefix and ~w250 size,
-    NOT the ingredient images (which are ~w1750).
+    Extract the perfume bottle image from a Wikiparfum page.
+    Bottle images use w250 sizing. Ingredient images use w1750.
     """
-    # Strategy 1: Look for img tags with the CDN prefix and w250 (bottle thumbnails)
     for img in soup.select("img"):
         src = img.get("src", "")
         if CDN_PREFIX in src and "-w250-" in src:
-            # This is a bottle/product image (250px wide)
             return src
 
-    # Strategy 2: og:image meta tag (often the bottle)
     og = soup.select_one("meta[property='og:image']")
     if og:
         content = og.get("content", "")
         if CDN_PREFIX in content:
             return content
 
-    # Strategy 3: Any CDN image that's NOT an ingredient (not w1750)
     for img in soup.select("img"):
         src = img.get("src", "")
         if CDN_PREFIX in src and "-w1750-" not in src and src.endswith(".jpg"):
@@ -86,48 +118,65 @@ def _extract_bottle_image(soup: BeautifulSoup) -> str | None:
     return None
 
 
+def _is_perfume_page(soup: BeautifulSoup) -> bool:
+    """Check if the page is actually a perfume detail page."""
+    title = soup.select_one("title")
+    if title:
+        t = title.get_text(strip=True).lower()
+        if "perfume" in t or "fragrance" in t:
+            return True
+
+    text = soup.get_text(strip=True).lower()
+    if "olfactive classification" in text:
+        return True
+
+    h1 = soup.select_one("h1")
+    if h1 and soup.select_one("a[href*='/brands/']"):
+        return True
+
+    return False
+
+
 async def fetch_wikiparfum_image(
     name: str,
     brand: str = "",
     client: httpx.AsyncClient | None = None,
 ) -> str | None:
     """
-    Try to find a bottle image for a perfume on Wikiparfum.
+    Find a bottle image for a perfume on Wikiparfum.
 
-    Approach:
-    1. Try direct slug URL (fast, no search needed)
-    2. If that fails, scrape the fragrances listing page with search
-    3. Find best match and extract bottle image
+    Approaches (in order):
+    1. Try multiple slug variations in parallel
+    2. Scrape brand page and find the perfume link
 
     Returns the CDN image URL or None.
     """
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(timeout=20, follow_redirects=True)
+        client = httpx.AsyncClient(timeout=15, follow_redirects=True)
 
     try:
-        # --- Approach 1: Direct slug guess ---
-        slug = _slugify(name)
-        image_url = await _try_direct_slug(client, slug)
-        if image_url:
-            return image_url
+        # --- Approach 1: Try slug variations in parallel ---
+        base_slug = _slugify(name)
+        slugs = []
+        for suffix in SLUG_SUFFIXES:
+            slug = f"{base_slug}{suffix}"
+            if slug not in slugs:
+                slugs.append(slug)
 
-        # Try with brand prefix removed from name if it starts with brand
+        urls = [f"{BASE}/en/fragrances/{s}" for s in slugs]
+        tasks = [_try_url(client, url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, str):
+                return result
+
+        # --- Approach 2: Brand page scrape ---
         if brand:
-            name_lower = name.lower()
-            brand_lower = brand.lower()
-            if name_lower.startswith(brand_lower):
-                clean_name = name[len(brand):].strip()
-                if clean_name:
-                    slug2 = _slugify(clean_name)
-                    image_url = await _try_direct_slug(client, slug2)
-                    if image_url:
-                        return image_url
-
-        # --- Approach 2: Search the fragrances page ---
-        image_url = await _search_and_scrape(client, name, brand)
-        if image_url:
-            return image_url
+            image_url = await _search_brand_page(client, name, brand)
+            if image_url:
+                return image_url
 
         return None
 
@@ -136,9 +185,8 @@ async def fetch_wikiparfum_image(
             await client.aclose()
 
 
-async def _try_direct_slug(client: httpx.AsyncClient, slug: str) -> str | None:
-    """Try fetching a direct Wikiparfum URL by slug."""
-    url = f"{BASE}/en/fragrances/{slug}"
+async def _try_url(client: httpx.AsyncClient, url: str) -> str | None:
+    """Try fetching a Wikiparfum URL and extract the bottle image."""
     try:
         resp = await client.get(url, headers=HEADERS)
         if resp.status_code != 200:
@@ -146,102 +194,61 @@ async def _try_direct_slug(client: httpx.AsyncClient, slug: str) -> str | None:
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Verify it's actually a perfume page (not a 404 or redirect)
-        title = soup.select_one("title")
-        if title and "perfume" in title.get_text(strip=True).lower():
-            return _extract_bottle_image(soup)
+        if not _is_perfume_page(soup):
+            return None
 
-        # Also accept pages with the fragrance structure
-        h1 = soup.select_one("h1")
-        if h1 and h1.get_text(strip=True):
-            return _extract_bottle_image(soup)
-
-        return None
+        return _extract_bottle_image(soup)
     except Exception as e:
-        print(f"Wikiparfum direct slug error for {slug}: {e}")
+        print(f"Wikiparfum fetch error for {url}: {e}")
         return None
 
 
-async def _search_and_scrape(
+async def _search_brand_page(
     client: httpx.AsyncClient,
     name: str,
     brand: str,
 ) -> str | None:
     """
-    Search Wikiparfum fragrances listing and find a matching perfume.
-    Wikiparfum doesn't have a search API, so we use Google to find the page.
+    Fallback: Load the brand's page on Wikiparfum and find the perfume.
+    Brand pages list fragrances with links + thumbnail images.
+    e.g. https://www.wikiparfum.com/en/brands/dior
     """
-    # Build search query
-    search_query = f"{name} {brand}".strip()
+    slug = _brand_slug(brand)
+    brand_url = f"{BASE}/en/brands/{slug}"
 
-    # Try the fragrances listing page (it may have the perfume in its rendered HTML)
-    # This won't work for most since it's paginated/JS-loaded
-    # So we use a Google search approach instead
     try:
-        google_url = (
-            f"https://www.google.com/search?"
-            f"q=site:wikiparfum.com+fragrances+{quote_plus(search_query)}"
-            f"&num=5"
-        )
-        resp = await client.get(google_url, headers={
-            **HEADERS,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/122.0.0.0 Safari/537.36",
-        })
-
+        resp = await client.get(brand_url, headers=HEADERS)
         if resp.status_code != 200:
             return None
 
-        # Extract wikiparfum URLs from Google results
         soup = BeautifulSoup(resp.text, "html.parser")
-        wp_urls = []
+        name_lower = name.lower()
 
-        for a in soup.select("a[href]"):
-            href = a.get("href", "")
-            # Google wraps URLs in redirects
-            if "wikiparfum.com/en/fragrances/" in href:
-                # Extract actual URL
-                match = re.search(
-                    r'(https?://www\.wikiparfum\.com/en/fragrances/[a-z0-9-]+)',
-                    href,
-                )
-                if match:
-                    wp_urls.append(match.group(1))
+        best_match = None
+        best_score = 0.0
 
-        # Deduplicate
-        wp_urls = list(dict.fromkeys(wp_urls))
+        for link in soup.select("a[href*='/fragrances/']"):
+            href = link.get("href", "")
+            link_text = link.get_text(strip=True).lower()
 
-        # Try each URL
-        for wp_url in wp_urls[:3]:
-            try:
-                resp2 = await client.get(wp_url, headers=HEADERS)
-                if resp2.status_code != 200:
-                    continue
+            score = _similarity(name_lower, link_text)
+            if score > best_score and score > 0.4:
+                best_score = score
+                full_url = href if href.startswith("http") else f"{BASE}{href}"
+                best_match = full_url
 
-                soup2 = BeautifulSoup(resp2.text, "html.parser")
+            if name_lower in link_text or link_text in name_lower:
+                if score > best_score * 0.8:
+                    best_match = href if href.startswith("http") else f"{BASE}{href}"
+                    best_score = max(score, 0.6)
 
-                # Verify name match
-                title = soup2.select_one("title")
-                if title:
-                    title_text = title.get_text(strip=True).lower()
-                    if _similarity(name.lower(), title_text) > 0.3:
-                        img = _extract_bottle_image(soup2)
-                        if img:
-                            return img
-
-                # Fallback: just check if it has a bottle image
-                img = _extract_bottle_image(soup2)
-                if img:
-                    return img
-
-            except Exception:
-                continue
+        if best_match:
+            return await _try_url(client, best_match)
 
         return None
 
     except Exception as e:
-        print(f"Wikiparfum Google search error: {e}")
+        print(f"Wikiparfum brand page error for {brand}: {e}")
         return None
 
 
@@ -252,10 +259,7 @@ async def fetch_images_batch(
     """
     Fetch images for multiple perfumes.
     Returns dict of {perfume_id: image_url}.
-    Respects rate limits with semaphore.
     """
-    import asyncio
-
     semaphore = asyncio.Semaphore(max_concurrent)
     results = {}
 
@@ -269,17 +273,18 @@ async def fetch_images_batch(
                 return
 
             try:
-                url = await fetch_wikiparfum_image(name, brand)
-                if url:
-                    results[pid] = url
+                async with httpx.AsyncClient(
+                    timeout=15, follow_redirects=True
+                ) as client:
+                    url = await fetch_wikiparfum_image(name, brand, client)
+                    if url:
+                        results[pid] = url
             except Exception as e:
                 print(f"Batch image fetch error for {name}: {e}")
 
-            # Small delay between requests
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        tasks = [_fetch_one(p) for p in perfumes]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [_fetch_one(p) for p in perfumes]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     return results
