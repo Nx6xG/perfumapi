@@ -101,19 +101,53 @@ def _similarity(a: str, b: str) -> float:
 # ──────────────────────────────────────────────
 
 def _extract_bottle_image(soup: BeautifulSoup) -> str:
+    """
+    Extract the perfume bottle image from a Wikiparfum page.
+
+    Key insight: The bottle image is a standalone img NOT inside an
+    ingredient link. Some ingredient photos are also w250, so we must
+    filter those out by checking the parent <a> tag.
+    """
+    # Pass 1: w250 images NOT inside ingredient links and with empty/no alt
     for img in soup.select("img"):
         src = img.get("src", "")
-        if CDN_PREFIX in src and "-w250-" in src:
+        if CDN_PREFIX not in src or "-w250-" not in src:
+            continue
+        parent_a = img.find_parent("a")
+        if parent_a and "/ingredients/" in parent_a.get("href", ""):
+            continue
+        # Bottle images typically have empty alt text
+        alt = (img.get("alt") or "").strip()
+        if not alt:
             return src
+
+    # Pass 2: w250 images NOT inside ingredient links (even with alt)
+    for img in soup.select("img"):
+        src = img.get("src", "")
+        if CDN_PREFIX not in src or "-w250-" not in src:
+            continue
+        parent_a = img.find_parent("a")
+        if parent_a and "/ingredients/" in parent_a.get("href", ""):
+            continue
+        return src
+
+    # Pass 3: og:image
     og = soup.select_one("meta[property='og:image']")
     if og:
         content = og.get("content", "")
         if CDN_PREFIX in content:
             return content
+
+    # Pass 4: Any non-ingredient CDN image
     for img in soup.select("img"):
         src = img.get("src", "")
-        if CDN_PREFIX in src and "-w1750-" not in src and src.endswith(".jpg"):
-            return src
+        if CDN_PREFIX not in src or "-w1750-" in src or not src.endswith(".jpg"):
+            continue
+        parent_a = img.find_parent("a")
+        if parent_a and "/ingredients/" in parent_a.get("href", ""):
+            continue
+        return src
+
     return ""
 
 
