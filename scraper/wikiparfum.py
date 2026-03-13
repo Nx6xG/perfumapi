@@ -317,21 +317,42 @@ async def search_wikiparfum(
 
     Strategy:
     1. Try slug variations as direct perfume URLs (parallel)
-    2. Always try query as brand name → scrape brand page
-    3. If multi-word, also try first word as brand
+    2. Try sub-combinations (drop each word) as slugs
+    3. Try query as brand name → scrape brand page
+    4. If multi-word, try first word as brand
     """
-    base_slug = _slugify(query)
-    slugs = []
-    for suffix in SLUG_SUFFIXES:
-        slug = f"{base_slug}{suffix}"
-        if slug not in slugs:
-            slugs.append(slug)
+    parts = query.strip().split()
 
-    urls = [f"{BASE}/en/fragrances/{s}" for s in slugs]
+    # Build all slug candidates: full query + sub-combinations
+    slug_candidates = set()
+
+    # Full query slugs
+    base_slug = _slugify(query)
+    for suffix in SLUG_SUFFIXES:
+        slug_candidates.add(f"{base_slug}{suffix}")
+
+    # Sub-combinations: drop each word one at a time
+    if len(parts) >= 2:
+        for i in range(len(parts)):
+            sub = " ".join(parts[:i] + parts[i + 1:])
+            sub_slug = _slugify(sub)
+            for suffix in SLUG_SUFFIXES[:5]:  # fewer suffixes for sub-queries
+                slug_candidates.add(f"{sub_slug}{suffix}")
+
+    # For 3+ words, also try pairs
+    if len(parts) >= 3:
+        for i in range(len(parts)):
+            for j in range(i + 1, len(parts)):
+                pair = f"{parts[i]} {parts[j]}"
+                pair_slug = _slugify(pair)
+                for suffix in SLUG_SUFFIXES[:3]:
+                    slug_candidates.add(f"{pair_slug}{suffix}")
+
+    urls = [f"{BASE}/en/fragrances/{s}" for s in slug_candidates]
 
     results = []
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        # --- Step 1: Try slug variations ---
+        # --- Step 1: Try all slug variations in parallel ---
         tasks = [_try_url_full(client, url) for url in urls]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -354,7 +375,6 @@ async def search_wikiparfum(
             return brand_results[:limit]
 
         # --- Step 3: Multi-word → try first word as brand ---
-        parts = query.strip().split()
         if len(parts) >= 2:
             brand_results = await _search_brand_page_full(
                 client, query, parts[0], limit
